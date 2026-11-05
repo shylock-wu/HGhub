@@ -28,6 +28,14 @@ jobs:
           # 若希望同步后能触发 release.yml，在仓库 Secrets 里加一个 PAT 名为 SYNC_TOKEN 即可自动启用。
           token: ${{ secrets.SYNC_TOKEN || github.token }}
 
+      - name: Guard branch
+        run: |
+          # 定时任务只在默认分支跑；手动触发若选了别的分支，直接跳过，避免把别处的提交推到 main
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "::notice::当前分支 ${GITHUB_REF_NAME} 不是 main，跳过同步"
+            exit 0
+          fi
+
       - name: Configure git
         run: |
           git config user.name  'github-actions[bot]'
