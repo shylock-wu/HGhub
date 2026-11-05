@@ -1,0 +1,70 @@
+name: Sync fork with upstream
+
+# 把上游 Minireel/HGhub 的 main 合并到本 fork 的 main。
+# fork 里已有自有提交（含本文件），所以用 merge 而非 fast-forward / gh repo sync。
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 每天 03:17 UTC（北京时间 11:17）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 默认用 GITHUB_TOKEN：可以推送，但推出来的提交不会触发其他 workflow。
+          # 若希望同步后能触发 release.yml，在仓库 Secrets 里加一个 PAT 名为 SYNC_TOKEN 即可自动启用。
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Merge upstream/main
+        run: |
+          git remote add upstream https://github.com/Minireel/HGhub.git
+          git fetch --prune --no-tags upstream
+          if git merge --no-edit upstream/main; then
+            git push origin HEAD:main
+          else
+            git merge --abort
+            echo "::error::与上游 main 存在冲突，需要手动处理"
+            exit 1
+          fi
+
+      - name: Open issue on conflict
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '上游同步冲突，需要手动处理';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            if (open.some((i) => i.title === title)) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: [
+                '自动同步上游 `Minireel/HGhub` 失败，需要手动解决冲突。',
+                '',
+                `运行记录：${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n'),
+            });
