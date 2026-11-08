@@ -44,7 +44,7 @@ Windows / macOS / Android 三端 · Fluent 设计 · 沉浸式竖屏播放
 
 | 层 | 选型 |
 | --- | --- |
-| 壳 | Tauri 2（Rust 1.9x） |
+| 壳 | Tauri 2（Rust 1.90+） |
 | 前端 | React 19 + TypeScript + Vite 7 + Tailwind CSS 4 |
 | 播放 | hls.js（HLS / AES-128） |
 | 网络 | reqwest + rustls |
@@ -94,6 +94,8 @@ pnpm android:build    # 产出 APK
   pnpm 11 起该字段失效，白名单改在 `pnpm-workspace.yaml` 的 `allowBuilds`（两处都保留）。
 
 ## 实现要点
+
+安全加固后的正文处理、FakeIP/内网限制、账号线路隔离及本地回归方法，见 [客户端内容与网络安全](docs/security.md)。镜像线路仅支持游客浏览，跨站点切换和首次升级后需要重新登录。
 
 1. **统一边缘信封**：站点把 `/api/**` 收敛为 `POST /api/edge/request`（`method/path/body(base64)/content_type` + `Authorization: Bearer`），本项目只对接这一个入口，无需处理 Cookie。
 2. **封面解密**：封面为 AES-128-CBC 密文，Rust 侧解密后经自定义协议输出，前端 `<img>` 直接使用。

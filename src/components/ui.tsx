@@ -60,10 +60,10 @@ export function Modal({ open, onClose, children, width = 340 }: { open: boolean;
 }
 
 /* ——— 开关 ——— */
-export function Toggle({ on, onChange, label }: { on: boolean; onChange: (b: boolean) => void; label?: string }) {
+export function Toggle({ on, onChange, label, disabled = false }: { on: boolean; onChange: (b: boolean) => void; label?: string; disabled?: boolean }) {
   return (
-    <button onClick={() => onChange(!on)} aria-pressed={on} aria-label={label}
-      className={`relative w-[46px] h-[26px] rounded-full transition-colors duration-200 ${on ? "bg-primary" : "bg-s4"}`}>
+    <button disabled={disabled} onClick={() => onChange(!on)} aria-pressed={on} aria-label={label}
+      className={`relative w-[46px] h-[26px] rounded-full transition-colors duration-200 disabled:opacity-50 disabled:cursor-wait ${on ? "bg-primary" : "bg-s4"}`}>
       <span className={`absolute top-[3px] w-5 h-5 rounded-full elev-1 transition-all duration-200 ${on ? "left-[23px] bg-on-primary" : "left-[3px] bg-mut"}`} />
     </button>
   );

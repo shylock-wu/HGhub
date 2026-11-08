@@ -41,6 +41,10 @@ export default function Player({
 
     if (Hls.isSupported()) {
       const hls = new Hls({
+        // 禁用从插播/内容引导 JSON 派生直连 URL 的可选功能。
+        interstitialsController: undefined,
+        contentSteeringController: undefined,
+        enableInterstitialPlayback: false,
         enableWorker: true,
         lowLatencyMode: false,
         maxBufferLength: 24,

@@ -19,12 +19,15 @@
 //! 排查手段：环境变量 `HGHUB_PROXY=http://127.0.0.1:7897` 可强制指定代理，
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
+use crate::network_policy;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// 默认上游（固定线路 1）。
@@ -42,23 +45,35 @@ pub fn base() -> String {
         .unwrap_or_else(|_| DEFAULT_BASE.to_string())
 }
 
-/// 规整线路地址：必须是 http(s) 且带 host，去掉结尾斜杠。
-pub fn normalize_base(url: &str) -> Option<String> {
-    let trimmed = url.trim();
-    let parsed = url::Url::parse(trimmed).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+/// 线路必须是纯 HTTPS origin，不允许路径、认证、查询串或片段。
+pub fn normalize_base(raw: &str) -> Option<String> {
+    let parsed = network_policy::parse_target(raw.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return None;
     }
-    parsed.host_str()?;
-    Some(trimmed.trim_end_matches('/').to_string())
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// 远端发布页只提供游客镜像，不能扩展账号密码的信任范围。
+pub fn trusted_auth_origin(origin: &str) -> bool {
+    matches!(origin, "https://huangguoai.com" | "https://huangguoai.ai")
 }
 
 /// 启动时读回上次选择的线路（文件不存在 / 内容坏了就保持默认）。
 pub fn bind_base(dir: &std::path::Path) {
+    network_policy::bind_security(dir);
     let path = dir.join("line.json");
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            if let Some(next) = v.get("base").and_then(|x| x.as_str()).and_then(normalize_base) {
+            if let Some(next) = v
+                .get("base")
+                .and_then(|x| x.as_str())
+                .and_then(normalize_base)
+            {
                 if let Ok(mut cur) = BASE.write() {
                     *cur = next;
                 }
@@ -72,7 +87,8 @@ pub fn bind_base(dir: &std::path::Path) {
 
 /// 切换线路并落盘，返回规整后的地址。
 pub fn set_base(url: &str) -> Result<String, String> {
-    let next = normalize_base(url).ok_or_else(|| "线路地址无效（需要 http(s)://域名）".to_string())?;
+    let next = normalize_base(url)
+        .ok_or_else(|| "线路地址无效（需要纯 HTTPS 站点地址，禁止内网）".to_string())?;
     if let Ok(mut cur) = BASE.write() {
         *cur = next.clone();
     }
@@ -99,38 +115,132 @@ fn proxy_override() -> Option<String> {
 /// 注意：reqwest 的 `system-proxy` 只在构建时读一次注册表 / 环境变量。代理软件被关掉后，
 /// 旧客户端仍会往 `127.0.0.1:7897` 建隧道，症状是满屏 `tunnel error: failed to create
 /// underlying connection`（浏览器却是通的，因为它每次都重读系统代理）。所以这里允许重建。
-fn build_client() -> reqwest::Client {
+fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
         .gzip(true)
         .brotli(true)
         .pool_idle_timeout(Duration::from_secs(60));
+    if !addrs.is_empty() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
     if let Some(p) = proxy_override() {
-        match reqwest::Proxy::all(&p) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            Err(e) => eprintln!("[net] 忽略无效的 HGHUB_PROXY={p}: {e}"),
+        // 错误信息不能含原始代理 URL（其中可能有用户名/密码）。
+        let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUB_PROXY 配置无效（已隐藏原始值）")?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|_| "无法创建 HTTP 客户端".to_string())
+}
+
+const CLIENT_TTL: Duration = Duration::from_secs(30);
+type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
+static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
+    cache
+        .get(key)
+        .filter(|(expires, _)| now < *expires)
+        .map(|(_, http)| http.clone())
+}
+
+/// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
+/// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
+async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+    let strict = network_policy::strict_security();
+    let target = network_policy::parse_target_with_mode(raw, strict)?;
+    let host = target.host_str().ok_or("目标缺少主机名")?;
+    let port = target.port_or_known_default().ok_or("目标端口无效")?;
+    let key = format!("{strict}:{host}:{port}");
+    {
+        let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
+        if let Some(http) = cached_client(&cache, &key, Instant::now()) {
+            return Ok((target, http));
         }
     }
-    builder.build().expect("build http client")
+    let addrs = if strict {
+        network_policy::resolve_target(&target, strict).await?
+    } else {
+        Vec::new()
+    };
+    let http = Arc::new(build_client(host, &addrs)?);
+    let now = Instant::now();
+    let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
+    // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
+    let http = cached_client(&cache, &key, now).unwrap_or(http);
+    if !cache.get(&key).is_some_and(|(expires, _)| now < *expires) {
+        cache.retain(|_, (expires, _)| now < *expires);
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, (now + CLIENT_TTL, http.clone()));
+    }
+    Ok((target, http))
 }
 
-static CLIENT: Lazy<RwLock<Arc<reqwest::Client>>> = Lazy::new(|| RwLock::new(Arc::new(build_client())));
-
-/// 当前 HTTP 客户端（克隆只是 Arc 计数）。
-pub fn client() -> Arc<reqwest::Client> {
-    CLIENT
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_else(|_| Arc::new(build_client()))
-}
-
-/// 重新读取系统代理。代理软件开关过之后调用；在途请求仍用旧客户端跑完，不影响。
 pub fn refresh_client() {
-    let fresh = Arc::new(build_client());
-    if let Ok(mut cur) = CLIENT.write() {
-        *cur = fresh;
+    if let Ok(mut cache) = CLIENTS.lock() {
+        cache.clear();
+    }
+}
+
+/// 不可信 GET 的统一入口；自动重定向被关闭，每一跳重新检查 URL、DNS 并固定解析地址。
+pub async fn get(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    tokio::time::timeout(timeout, async {
+        let mut next = network_policy::parse_target(raw)?;
+        for hop in 0..=5 {
+            let (target, http) = client_for(next.as_str()).await?;
+            let mut request = http.get(target.clone()).timeout(timeout);
+            if let Some(value) = accept {
+                request = request.header("Accept", value);
+            }
+            if let Some(value) = referer {
+                request = request.header("Referer", value);
+            }
+            let response = request.send().await.map_err(|e| err_text(&e))?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            if hop == 5 {
+                return Err("重定向次数超过限制".into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .ok_or("重定向缺少有效 Location")?;
+            next = network_policy::redirect_target(&target, location)?;
+        }
+        Err("重定向次数超过限制".into())
+    })
+    .await
+    .map_err(|_| "请求超时".to_string())?
+}
+
+/// 只返回代理的协议/主机/端口；解析失败时隐藏整个值，绝不回传认证或查询参数。
+pub fn redact_proxy(raw: &str) -> String {
+    let parsed = url::Url::parse(raw.trim())
+        .ok()
+        .filter(|u| u.host_str().is_some());
+    match parsed {
+        Some(url) => {
+            let mut safe = format!("{}://{}", url.scheme(), url.host_str().unwrap());
+            if let Some(port) = url.port() {
+                safe.push_str(&format!(":{port}"));
+            }
+            safe
+        }
+        None => "[已配置，原始值已隐藏]".into(),
     }
 }
 
@@ -140,7 +250,8 @@ pub fn is_proxy_error(e: &str) -> bool {
     e.contains("tunnel") || e.contains("proxy")
 }
 
-static LAST_HEAL: Lazy<std::sync::Mutex<Option<Instant>>> = Lazy::new(|| std::sync::Mutex::new(None));
+static LAST_HEAL: Lazy<std::sync::Mutex<Option<Instant>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
 
 /// 请求失败后按需重建客户端：代理隧道错误、连接被拒 / 超时都算「网络环境可能变了」。
 /// 3 秒内只重建一次，批量探测不会反复重建。
@@ -183,6 +294,23 @@ pub fn err_text(e: &reqwest::Error) -> String {
     out
 }
 
+fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
+    let mut ips: Vec<_> = addrs.into_iter().map(|addr| addr.ip()).collect();
+    ips.sort_unstable();
+    ips.dedup();
+    let has_fake_ip = ips.iter().any(|ip| {
+        let v4 = match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        };
+        v4.is_some_and(|ip| {
+            let [a, b, _, _] = ip.octets();
+            a == 198 && (b == 18 || b == 19)
+        })
+    });
+    json!({ "count": ips.len(), "has_fake_ip": has_fake_ip })
+}
+
 /// 网络自检：DNS / HTTP / 代理相关环境变量，用于远程定位「打不开」。
 pub async fn diagnose() -> Value {
     let cur = base();
@@ -197,8 +325,8 @@ pub async fn diagnose() -> Value {
         tokio::task::spawn_blocking(move || {
             use std::net::ToSocketAddrs;
             match (host.as_str(), 443u16).to_socket_addrs() {
-                Ok(iter) => json!(iter.map(|a| a.ip().to_string()).collect::<Vec<_>>()),
-                Err(e) => json!(format!("解析失败: {e}")),
+                Ok(iter) => dns_summary(iter),
+                Err(_) => json!({ "error": "DNS 解析失败" }),
             }
         })
         .await
@@ -206,13 +334,13 @@ pub async fn diagnose() -> Value {
     };
 
     let started = Instant::now();
-    let http = match client().get(format!("{cur}/")).send().await {
+    let http = match get(&format!("{cur}/"), Duration::from_secs(20), None, None).await {
         Ok(r) => json!({
             "status": r.status().as_u16(),
             "ms": started.elapsed().as_millis() as u64,
         }),
         Err(e) => json!({
-            "error": err_text(&e),
+            "error": e,
             "ms": started.elapsed().as_millis() as u64,
         }),
     };
@@ -223,30 +351,31 @@ pub async fn diagnose() -> Value {
         "dns": dns,
         "http": http,
         "env": {
-            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok(),
-            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok(),
-            "ALL_PROXY": std::env::var("ALL_PROXY").ok(),
-            "NO_PROXY": std::env::var("NO_PROXY").ok(),
-            "HGHUB_PROXY": proxy_override(),
+            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok().map(|p| redact_proxy(&p)),
+            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok().map(|p| redact_proxy(&p)),
+            "ALL_PROXY": std::env::var("ALL_PROXY").ok().map(|p| redact_proxy(&p)),
+            "NO_PROXY": std::env::var("NO_PROXY").ok().map(|_| "[已配置，列表已隐藏]"),
+            "HGHUB_PROXY": proxy_override().map(|p| redact_proxy(&p)),
         },
     })
 }
 
 /// 站点偶发 TLS 抖动（实测），统一重试；碰上代理隧道错误就先重建客户端再试
 /// （代理软件开关后旧客户端会一直卡在 tunnel error 上）。
-async fn with_retry<F, Fut, T>(mut f: F) -> Result<T, String>
+async fn with_retry<F, Fut, T>(retry: bool, mut f: F) -> Result<T, String>
 where
-    F: FnMut(reqwest::Client) -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
     let mut last = String::from("network error");
-    for attempt in 0..3 {
-        match f(client().as_ref().clone()).await {
+    let attempts = if retry { 3 } else { 1 };
+    for attempt in 0..attempts {
+        match f().await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 last = e;
                 heal_client(&last);
-                if attempt < 2 {
+                if attempt + 1 < attempts {
                     tokio::time::sleep(Duration::from_millis(350 * (attempt as u64 + 1))).await;
                 }
             }
@@ -255,13 +384,38 @@ where
     Err(last)
 }
 
+/// 仅无请求体、无凭据的逻辑 GET 可以迁移网关；信封本身仍使用 POST。
+fn edge_redirect_target(
+    current: &url::Url,
+    status: u16,
+    location: &str,
+    guest_get: bool,
+) -> Result<url::Url, String> {
+    if !guest_get || !matches!(status, 301 | 302 | 303) {
+        return Err("业务接口重定向已拒绝".into());
+    }
+    network_policy::redirect_target(current, location)
+}
+
 /// 业务请求：走边缘信封。
 pub async fn edge(
+    origin: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
     token: Option<&str>,
 ) -> Result<Value, String> {
+    let cur = normalize_base(origin).ok_or("业务请求必须使用安全 HTTPS 线路")?;
+    if network_policy::strict_security()
+        && (token.is_some()
+            || matches!(
+                path,
+                "/api/account/loginByPassword" | "/api/account/registerByPassword"
+            ))
+        && !trusted_auth_origin(&cur)
+    {
+        return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
+    }
     let (encoded, ctype) = match &body {
         Some(v) => (
             B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
@@ -276,40 +430,62 @@ pub async fn edge(
         "content_type": ctype,
     });
 
-    let cur = base();
     let url = format!("{cur}/api/edge/request");
     let referer = format!("{cur}/");
     let token = token.map(|s| s.to_string());
 
-    let value = with_retry(|client: reqwest::Client| {
+    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
+    let value = with_retry(method.eq_ignore_ascii_case("GET") && body.is_none(), || {
         let envelope = envelope.clone();
         let token = token.clone();
         let url = url.clone();
         let referer = referer.clone();
         async move {
-            let mut req = client
-                .post(&url)
-                .header("Accept", "application/json")
-                .header("Referer", &referer)
-                .json(&envelope);
-            if let Some(t) = token.as_deref() {
-                if !t.is_empty() {
-                    req = req.header("Authorization", format!("Bearer {t}"));
+            let mut next = network_policy::parse_target(&url)?;
+            for hop in 0..=5 {
+                let (target, client) = client_for(next.as_str()).await?;
+                let mut req = client
+                    .post(target.clone())
+                    .header("Accept", "application/json")
+                    .header("Referer", &referer)
+                    .json(&envelope);
+                if let Some(t) = token.as_deref() {
+                    if !t.is_empty() {
+                        req = req.header("Authorization", format!("Bearer {t}"));
+                    }
                 }
+                let resp = req.send().await.map_err(|e| err_text(&e))?;
+                let status = resp.status();
+                // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
+                if status.is_redirection() {
+                    if hop == 5 {
+                        return Err("重定向次数超过限制".into());
+                    }
+                    let location = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|h| h.to_str().ok())
+                        .ok_or("重定向缺少有效 Location")?;
+                    next = edge_redirect_target(&target, status.as_u16(), location, guest_get)?;
+                    continue;
+                }
+                let text = resp.text().await.map_err(|e| err_text(&e))?;
+                if status.as_u16() == 401 || status.as_u16() == 403 {
+                    return Err("401".to_string());
+                }
+                if !status.is_success() {
+                    return Err(format!(
+                        "HTTP {status}: {}",
+                        text.chars().take(160).collect::<String>()
+                    ));
+                }
+                if text.trim().is_empty() {
+                    return Ok(Value::Null);
+                }
+                return serde_json::from_str::<Value>(&text)
+                    .map_err(|e| format!("{e}: {}", text.chars().take(160).collect::<String>()));
             }
-            let resp = req.send().await.map_err(|e| err_text(&e))?;
-            let status = resp.status();
-            let text = resp.text().await.map_err(|e| err_text(&e))?;
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err("401".to_string());
-            }
-            if !status.is_success() {
-                return Err(format!("HTTP {status}: {}", &text[..text.len().min(160)]));
-            }
-            if text.trim().is_empty() {
-                return Ok(Value::Null);
-            }
-            serde_json::from_str::<Value>(&text).map_err(|e| format!("{e}: {}", &text[..text.len().min(160)]))
+            Err("重定向次数超过限制".into())
         }
     })
     .await?;
@@ -334,16 +510,11 @@ pub async fn edge(
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
     let url = url.to_string();
     let referer = format!("{}/", base());
-    with_retry(|client: reqwest::Client| {
+    with_retry(true, || {
         let url = url.clone();
         let referer = referer.clone();
         async move {
-            let resp = client
-                .get(&url)
-                .header("Referer", &referer)
-                .send()
-                .await
-                .map_err(|e| err_text(&e))?;
+            let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
             if !resp.status().is_success() {
                 return Err(format!("HTTP {}", resp.status()));
             }
@@ -363,9 +534,161 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 mod tests {
     use super::*;
 
-    /// 手动跑：`cargo test --lib net::tests::diag -- --nocapture`
+    #[tokio::test]
+    async fn non_idempotent_operations_are_attempted_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (retry, expected) in [(false, 1), (true, 3)] {
+            let calls = AtomicUsize::new(0);
+            let result = with_retry(retry, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>("rejected".to_string())
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[test]
+    fn dns_diagnostics_only_expose_counts_and_fake_ip_presence() {
+        let addrs: Vec<SocketAddr> = ["10.0.0.1:443", "198.18.0.2:443", "[::ffff:198.18.0.3]:443"]
+            .into_iter()
+            .map(|raw| raw.parse().unwrap())
+            .collect();
+        let summary = dns_summary(addrs);
+        assert_eq!(summary, json!({"count": 3, "has_fake_ip": true}));
+        assert!(!summary.to_string().contains("10.0.0.1"));
+        assert!(!summary.to_string().contains("198.18"));
+        assert_eq!(
+            dns_summary(Vec::<SocketAddr>::new()),
+            json!({"count":0,"has_fake_ip":false})
+        );
+    }
+
+    #[test]
+    fn pinned_clients_expire_without_extending_the_dns_ttl() {
+        let now = Instant::now();
+        let client = Arc::new(reqwest::Client::new());
+        let mut cache = ClientCache::new();
+        cache.insert(
+            "true:example.com:443".into(),
+            (now + CLIENT_TTL, client.clone()),
+        );
+        assert!(Arc::ptr_eq(
+            &cached_client(
+                &cache,
+                "true:example.com:443",
+                now + Duration::from_secs(29)
+            )
+            .unwrap(),
+            &client
+        ));
+        assert!(cached_client(&cache, "true:example.com:443", now + CLIENT_TTL).is_none());
+        assert!(cached_client(&cache, "false:example.com:443", now).is_none());
+        assert!(cached_client(&cache, "true:example.com:8443", now).is_none());
+    }
+
+    #[test]
+    fn edge_redirects_only_replay_anonymous_reads() {
+        let current = url::Url::parse("https://huangguoai.ai/api/edge/request").unwrap();
+        assert_eq!(
+            edge_redirect_target(
+                &current,
+                301,
+                "https://huangguoai.com/api/edge/request",
+                true
+            )
+            .unwrap()
+            .host_str(),
+            Some("huangguoai.com")
+        );
+        assert!(edge_redirect_target(&current, 302, "/next", true).is_ok());
+        for status in [301, 302, 303, 307, 308] {
+            assert!(edge_redirect_target(&current, status, "/next", false).is_err());
+        }
+        for status in [307, 308] {
+            assert!(edge_redirect_target(&current, status, "/next", true).is_err());
+        }
+        assert!(edge_redirect_target(&current, 301, "http://example.com/", true).is_err());
+        assert!(edge_redirect_target(&current, 301, "https://127.0.0.1/", true).is_err());
+    }
+
+    #[test]
+    fn proxy_credentials_and_query_are_redacted() {
+        assert_eq!(
+            redact_proxy("http://alice:p%40ss@127.0.0.1:7897/path?token=secret#hidden"),
+            "http://127.0.0.1:7897"
+        );
+        assert_eq!(
+            redact_proxy("socks5://alice:secret@[::1]:1080"),
+            "socks5://[::1]:1080"
+        );
+        for raw in ["alice:secret@127.0.0.1:7897", "not a url secret", ""] {
+            assert_eq!(redact_proxy(raw), "[已配置，原始值已隐藏]");
+        }
+    }
+
+    #[test]
+    fn base_requires_https_origin_and_auth_trust_is_static() {
+        assert_eq!(
+            normalize_base("https://HUANGGUOAI.COM:443/"),
+            Some(DEFAULT_BASE.into())
+        );
+        for raw in [
+            "http://huangguoai.com",
+            "https://user:pass@huangguoai.com",
+            "https://huangguoai.com/path",
+            "https://huangguoai.com/?secret=1",
+            "https://huangguoai.com/#fragment",
+            "https://192.168.1.1",
+        ] {
+            assert_eq!(normalize_base(raw), None, "{raw}");
+        }
+        assert!(trusted_auth_origin(DEFAULT_BASE));
+        assert!(trusted_auth_origin("https://huangguoai.ai"));
+        assert!(!trusted_auth_origin("https://mirror.example"));
+        assert!(!trusted_auth_origin("https://huangguoai.com.evil.example"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_origins_reject_credentials_before_network() {
+        for (path, body, token) in [
+            (
+                "/api/account/loginByPassword",
+                Some(json!({"password":"secret"})),
+                None,
+            ),
+            (
+                "/api/account/registerByPassword",
+                Some(json!({"password":"secret"})),
+                None,
+            ),
+            ("/api/videos", None, Some("secret-token")),
+        ] {
+            let err = edge("https://mirror.invalid", "POST", path, body, token)
+                .await
+                .unwrap_err();
+            assert!(err.contains("镜像线路仅供游客浏览"));
+        }
+    }
+
+    #[tokio::test]
+    async fn private_get_is_rejected_before_network() {
+        let err = get(
+            "http://127.0.0.1:1/private",
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("禁止访问"));
+    }
+
+    /// 手动跑：`cargo test --lib -- --ignored net::tests::diag -- --nocapture`
     /// 关掉 TUN、只留系统代理时跑一遍，能直接看出客户端有没有走代理。
     #[tokio::test]
+    #[ignore = "联网测试：请求上游做网络自检，手动用 --ignored 运行"]
     async fn diag() {
         println!(
             "{}",

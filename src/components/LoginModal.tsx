@@ -68,7 +68,7 @@ export default function LoginModal() {
         </button>
       </div>
       <p className="text-[10.5px] text-dim mt-3 leading-relaxed">
-        使用黄果短剧官网账号登录，登录态仅保存在本机。
+        使用黄果短剧官网账号登录。登录、注册仅支持固定线路；镜像线路请以游客浏览。
       </p>
     </div>
   );

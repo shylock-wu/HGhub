@@ -33,7 +33,7 @@ function Row({ item, current, probe, busy, disabled, onPick, onProbe }: {
 
 /* 线路选择：桌面居中弹窗，移动端底部抽屉 */
 export default function LinePicker({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { toast } = useStore();
+  const { toast, setUser } = useStore();
   const [state, setState] = useState<LineState | null>(null);
   const [mirrors, setMirrors] = useState<LineItem[] | null>(null);
   const [mirrorErr, setMirrorErr] = useState("");
@@ -90,8 +90,9 @@ export default function LinePicker({ open, onClose }: { open: boolean; onClose: 
     setSwitching(url);
     try {
       const next = await api.lineSet(url);
+      if (next !== state?.base) setUser(null);
       setState((s) => (s ? { ...s, base: next } : s));
-      toast(`线路已切换到 ${hostOf(next)}`, "ok");
+      toast(`线路已切换到 ${hostOf(next)}，跨站点需重新登录`, "ok");
     } catch (e) {
       toast((e as Error).message || "切换失败", "info");
     } finally {
@@ -132,7 +133,7 @@ export default function LinePicker({ open, onClose }: { open: boolean; onClose: 
 
         <div className="flex items-center gap-2 px-1 mt-4 mb-1.5">
           <span className="text-[10.5px] font-semibold text-dim tracking-wide">镜像线路</span>
-          <span className="text-[10px] text-dim">huangguoai.pages.dev · 一般可直连</span>
+          <span className="text-[10px] text-dim">一般可直连 · 仅游客浏览</span>
           <button onClick={() => { void readMirrors(); }} disabled={loadingMirrors}
             className="ml-auto inline-flex items-center gap-1 text-[10.5px] text-primary pressable disabled:opacity-50">
             <IRefresh size={12} />{loadingMirrors ? "获取中…" : "刷新"}

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && tsc --project tsconfig.tests.json && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:dev": "tauri dev",
@@ -19,6 +19,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
     "clsx": "2.1.1",
+    "dompurify": "3.4.17",
     "hls.js": "1.6.15",
     "react": "19.2.6",
     "react-dom": "19.2.6",

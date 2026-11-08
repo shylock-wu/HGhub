@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, cover, fmt, platform } from "../api";
 import type { Post } from "../types";
 import { useStore } from "../store";
 import { Empty, Img } from "../components/ui";
 import Player from "../components/Player";
 import { IBack, IFireF, IPlayF } from "../icons";
-import { sanitizeHtml } from "../html";
+import { handleArticleClick, sanitizeHtml } from "../html";
 
 /* ================= 吃瓜列表 ================= */
 export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean }) {
@@ -87,10 +87,17 @@ const isHtml = (s: string) => /<(p|div|br|img|h[1-6]|ul|ol|li|blockquote|span|st
 
 /* ================= 吃瓜详情（网页式浏览） ================= */
 export function PostDetail({ id, onBack }: { id: number; onBack: () => void }) {
-  const { toast } = useStore();
+  const { toast, strictSecurity } = useStore();
   const [post, setPost] = useState<(Post & { content?: string; video_url?: string }) | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [play, setPlay] = useState(false);
+  const content = post?.content || "";
+  const safeHtml = useMemo(() => sanitizeHtml(content), [content, strictSecurity]);
+  const openSafeLink = (url: string) => {
+    api.openUrl(url).catch(() => {
+      navigator.clipboard?.writeText(url).then(() => toast("链接已复制", "ok")).catch(() => {});
+    });
+  };
 
   useEffect(() => {
     let alive = true;
@@ -140,8 +147,8 @@ export function PostDetail({ id, onBack }: { id: number; onBack: () => void }) {
                 ))}
               </div>
               {post.content && (
-                isHtml(post.content)
-                  ? <div className="article-body mt-3.5" dangerouslySetInnerHTML={{ __html: sanitizeHtml(post.content) }} />
+                (isHtml(post.content) || (!strictSecurity && /<[a-z][\s\S]*>/i.test(post.content)))
+                  ? <div className="article-body mt-3.5" onClick={(e) => handleArticleClick(e, openSafeLink)} dangerouslySetInnerHTML={{ __html: safeHtml }} />
                   : <div className="mt-3.5 rounded-(--r-md) bg-s2 p-3.5 text-[12.5px] leading-relaxed text-on/80 whitespace-pre-wrap">{post.content}</div>
               )}
             </div>

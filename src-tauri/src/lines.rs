@@ -89,29 +89,25 @@ pub async fn probe(urls: Vec<String>) -> Value {
 async fn probe_one(url: String) -> Value {
     let target = format!("{}/", url.trim_end_matches('/'));
     let started = Instant::now();
-    let res = crate::net::client()
-        .get(&target)
-        .timeout(PROBE_TIMEOUT)
-        .header("Accept", "text/html,application/xhtml+xml")
-        .send()
-        .await;
+    let res = crate::net::get(
+        &target,
+        PROBE_TIMEOUT,
+        Some("text/html,application/xhtml+xml"),
+        None,
+    )
+    .await;
     let ms = started.elapsed().as_millis() as u64;
     match res {
         Ok(r) => {
             let status = r.status().as_u16();
             json!({ "url": url, "ok": status < 400, "status": status, "ms": ms })
         }
-        Err(e) => json!({ "url": url, "ok": false, "ms": ms, "error": crate::net::err_text(&e) }),
+        Err(e) => json!({ "url": url, "ok": false, "ms": ms, "error": e }),
     }
 }
 
 async fn get_text(url: &str) -> Result<String, String> {
-    let resp = crate::net::client()
-        .get(url)
-        .timeout(Duration::from_secs(12))
-        .send()
-        .await
-        .map_err(|e| crate::net::err_text(&e))?;
+    let resp = crate::net::get(url, Duration::from_secs(12), None, None).await?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -137,13 +133,9 @@ fn absolute(base: &str, rel: &str) -> String {
     if rel.starts_with("http://") || rel.starts_with("https://") {
         return rel.to_string();
     }
-    let origin = url::Url::parse(base).ok().map(|u| {
-        format!(
-            "{}://{}",
-            u.scheme(),
-            u.host_str().unwrap_or_default()
-        )
-    });
+    let origin = url::Url::parse(base)
+        .ok()
+        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()));
     match origin {
         Some(o) if rel.starts_with('/') => format!("{o}{rel}"),
         Some(o) => format!("{o}/{rel}"),
@@ -236,7 +228,11 @@ var foreverUrls = [
         assert_eq!(js_array(SAMPLE, "var subdomains"), vec!["thu", "pku"]);
         assert_eq!(
             js_array(SAMPLE, "var foreverUrls"),
-            vec!["https://huangguoai.com", "JumpPage", "https://huangguoai.ai"]
+            vec![
+                "https://huangguoai.com",
+                "JumpPage",
+                "https://huangguoai.ai"
+            ]
         );
     }
 
@@ -258,8 +254,9 @@ var foreverUrls = [
         assert_eq!(script_src(html).as_deref(), Some("publish.js?20261103-2"));
     }
 
-    /// 手动跑：`cargo test --lib lines::tests::mirrors_live -- --nocapture`
+    /// 手动跑：`cargo test --lib -- --ignored lines::tests::mirrors_live -- --nocapture`
     #[tokio::test]
+    #[ignore = "联网测试：请求上游镜像列表，手动用 --ignored 运行"]
     async fn mirrors_live() {
         match mirrors().await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v).expect("json")),
@@ -267,14 +264,18 @@ var foreverUrls = [
         }
     }
 
-    /// 手动跑：`cargo test --lib lines::tests::probe_live -- --nocapture`
+    /// 手动跑：`cargo test --lib -- --ignored lines::tests::probe_live -- --nocapture`
     #[tokio::test]
+    #[ignore = "联网测试：探测上游线路连通性，手动用 --ignored 运行"]
     async fn probe_live() {
         let urls = vec![
             "https://huangguoai.com".to_string(),
             "https://huangguoai.ai".to_string(),
             "https://thu.xxbgwypx.cc".to_string(),
         ];
-        println!("{}", serde_json::to_string_pretty(&probe(urls).await).expect("json"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&probe(urls).await).expect("json")
+        );
     }
 }

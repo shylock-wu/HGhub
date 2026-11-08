@@ -5,7 +5,7 @@ description = "HGhub · 黄果短剧客户端"
 authors = ["HGhub"]
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 
 [lib]
 name = "huangguo_client_lib"
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-opener = "=2.7.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 注意：system-proxy 必须显式列出。关掉 default-features 会连带丢掉它，
@@ -29,7 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "charset",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 aes = "0.8"
 base64 = "0.22"
 percent-encoding = "2"

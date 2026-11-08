@@ -3,12 +3,12 @@ import { api, APP_VERSION, hostOf, logLine, platform, type UpdateInfo } from "..
 import { useStore } from "../store";
 import { Modal, Toggle } from "../components/ui";
 import LinePicker from "../components/LinePicker";
-import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, IMoon, IRefresh, ISettings, ISun } from "../icons";
+import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun } from "../icons";
 
 /* 独立设置页：线路 / 外观 / 本地数据 / 清理缓存 / 网络诊断 / 关于
    入口：Windows 侧栏「设置」、Android「我的」右上角齿轮 */
 export default function Settings({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { theme, setTheme, favs, history, toast } = useStore();
+  const { theme, setTheme, favs, history, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast } = useStore();
   const [about, setAbout] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -100,6 +100,27 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
+            <div className="flex items-center gap-3 px-3.5 py-3">
+              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ILockF size={15} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] text-on">严格安全模式</div>
+                <div className="text-[10.5px] text-mut">
+                  {cliRelaxed
+                    ? "已由启动参数 --no-strict 切换为兼容模式；可手动重新开启"
+                    : "默认开启，防上游投毒与内网探测；若导致正文或特殊代理异常可关闭（或用 --no-strict 启动）"}
+                </div>
+              </div>
+              <Toggle
+                on={strictSecurity}
+                disabled={!strictSecurityReady || securityPending}
+                onChange={(on) => {
+                  void setStrictSecurity(on).then(() => {
+                    toast(on ? "已开启严格安全模式" : "已切换为兼容模式（关闭激进清洗与守卫）", "info");
+                  }).catch(() => toast("安全设置保存失败，已保持原模式", "info"));
+                }}
+                label="严格安全模式"
+              />
+            </div>
             {/* 打不开时先点这里：把 DNS / 代理 / HTTP 结果复制给维护者 */}
             <button onClick={async () => {
               try {

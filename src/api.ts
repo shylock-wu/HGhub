@@ -48,7 +48,15 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 /* ── 接口 ───────────────────────────────────────────────── */
 
 export const api = {
-  boot: () => call<{ user: User | null; logged_in: boolean; base: string }>("app_boot"),
+  boot: () =>
+    call<{
+      user: User | null;
+      logged_in: boolean;
+      base: string;
+      strict_security?: boolean;
+      cli_relaxed?: boolean;
+    }>("app_boot"),
+  securitySet: (strict: boolean) => call<boolean>("security_set", { strict }),
   login: (username: string, password: string) =>
     call<{ user: User }>("api_login", { username, password }),
   register: (username: string, password: string, email = "") =>
